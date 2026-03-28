@@ -1,7 +1,7 @@
 """
 Tests for route stability across refactored web runtime branches.
 
-Code version: v1.1.0
+Code version: v1.2.0
 """
 
 from __future__ import annotations
@@ -39,6 +39,22 @@ class MorePageTests(unittest.TestCase):
             {path: response.status_code for path, response in responses.items()},
             {path: 200 for path in responses},
         )
+
+    def test_exact_range_markup_exposes_shared_date_roles(self) -> None:
+        client = create_app().test_client()
+
+        responses = {
+            "/compare": client.get("/compare?ticker=QQQ&ticker=AAPL&range=exact&from=2026-03-27&to=2026-03-28"),
+            "/portfolio": client.get(
+                "/portfolio?ticker=QQQ&ticker=AAPL&weight=60&weight=40&range=exact&from=2026-03-27&to=2026-03-28"
+            ),
+            "/backtest": client.get("/backtest?ticker=QQQ&strategy=buy-and-hold&range=exact&from=2026-03-27&to=2026-03-28"),
+        }
+
+        for response in responses.values():
+            body = response.get_data(as_text=True)
+            self.assertIn('data-date-role="start"', body)
+            self.assertIn('data-date-role="end"', body)
 
     def test_refactored_runtime_apis_respond_successfully(self) -> None:
         client = create_app().test_client()
