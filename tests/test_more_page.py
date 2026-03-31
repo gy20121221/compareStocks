@@ -19,6 +19,27 @@ class MorePageTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_more_investment_page_renders_from_more_section(self) -> None:
+        client = create_app().test_client()
+
+        response = client.get("/more/investment")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("My Investment", response.get_data(as_text=True))
+
+    def test_legacy_invest_routes_redirect_to_more_investment(self) -> None:
+        client = create_app().test_client()
+
+        response = client.get("/invest")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/more/investment")
+
+        alias_response = client.get("/more/invest")
+
+        self.assertEqual(alias_response.status_code, 302)
+        self.assertEqual(alias_response.headers["Location"], "/more/investment")
+
     def test_primary_workspace_pages_render_after_runtime_split(self) -> None:
         client = create_app().test_client()
 
