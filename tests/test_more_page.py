@@ -27,6 +27,16 @@ class MorePageTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("My Investment", response.get_data(as_text=True))
 
+    def test_more_investment_page_uses_shared_select_markup_for_event_type(self) -> None:
+        client = create_app().test_client()
+
+        response = client.get("/more/investment")
+        body = response.get_data(as_text=True)
+
+        self.assertIn('data-shared-select-kind="event-type"', body)
+        self.assertIn('data-shared-select-trigger', body)
+        self.assertIn('data-shared-select-dropdown', body)
+
     def test_legacy_invest_routes_redirect_to_more_investment(self) -> None:
         client = create_app().test_client()
 
