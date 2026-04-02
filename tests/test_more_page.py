@@ -25,7 +25,7 @@ class MorePageTests(unittest.TestCase):
         response = client.get("/more/investment")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("My Investment", response.get_data(as_text=True))
+        self.assertIn("My investment", response.get_data(as_text=True))
 
     def test_more_investment_page_uses_shared_select_markup_for_event_type(self) -> None:
         client = create_app().test_client()
