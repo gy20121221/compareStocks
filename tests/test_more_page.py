@@ -6,12 +6,38 @@ Code version: v0.3.0
 
 from __future__ import annotations
 
+import io
+import json
+from pathlib import Path
 import unittest
 
 from app import create_app
+from app.infrastructure.storage import INVESTMENT_STORE_PATH
 
 
 class MorePageTests(unittest.TestCase):
+    def _build_sample_transactions_csv(self) -> str:
+        return "\n".join([
+            "Statement,Header,Field Name,Field Value",
+            "Statement,Data,Title,Transaction History",
+            "Summary,Header,Field Name,Field Value",
+            "Summary,Data,Starting Cash,1000.00",
+            "Summary,Data,Ending Cash,899.00",
+            "Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quantity,Price,Price Currency,Gross Amount ,Commission,Net Amount",
+            "Transaction History,Data,2026-03-01,U***TEST,Example Buy,Buy,QQQ,1,100,USD,-100,-1,-101",
+        ]) + "\n"
+
+    def _build_sample_positions_csv(self) -> str:
+        return "\n".join([
+            "Statement,Header,Field Name,Field Value",
+            "Statement,Data,Title,Realized Summary",
+            "Realized & Unrealized Performance Summary,Header,Asset Category,Symbol,Cost Adj.,Realized S/T Profit,Realized S/T Loss,Realized L/T Profit,Realized L/T Loss,Realized Total,Unrealized S/T Profit,Unrealized S/T Loss,Unrealized L/T Profit,Unrealized L/T Loss,Unrealized Total,Total,Code",
+            "Realized & Unrealized Performance Summary,Data,Stocks,QQQ,0,0,0,0,0,0,5,0,0,0,5,5,",
+            "Open Positions,Header,DataDiscriminator,Asset Category,Currency,Symbol,Open,Quantity,Mult,Cost Price,Cost Basis,Close Price,Value,Unrealized P/L,Code",
+            "Open Positions,Data,Summary,Stocks,USD,QQQ,-,1,1,100,100,105,105,5,",
+            "Open Positions,Total,,Stocks,USD,,,,,,100,,105,5,",
+        ]) + "\n"
+
     def test_more_timing_page_renders_after_storage_refactor(self) -> None:
         client = create_app().test_client()
 
@@ -27,15 +53,16 @@ class MorePageTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("My investment", response.get_data(as_text=True))
 
-    def test_more_investment_page_uses_shared_select_markup_for_event_type(self) -> None:
+    def test_more_investment_page_exposes_dual_csv_import_form(self) -> None:
         client = create_app().test_client()
 
         response = client.get("/more/investment")
         body = response.get_data(as_text=True)
 
-        self.assertIn('data-shared-select-kind="event-type"', body)
-        self.assertIn('data-shared-select-trigger', body)
-        self.assertIn('data-shared-select-dropdown', body)
+        self.assertIn('id="transactions_csv"', body)
+        self.assertIn('id="positions_csv"', body)
+        self.assertIn('enctype="multipart/form-data"', body)
+        self.assertIn('Your original CSV files are processed in memory only', body)
 
     def test_legacy_invest_routes_redirect_to_more_investment(self) -> None:
         client = create_app().test_client()
@@ -106,6 +133,43 @@ class MorePageTests(unittest.TestCase):
             {path: response.status_code for path, response in responses.items()},
             {path: 200 for path in responses},
         )
+
+    def test_ibkr_csv_import_rebuilds_investment_store(self) -> None:
+        client = create_app().test_client()
+        original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
+
+        try:
+            response = client.post(
+                "/api/investment/transactions",
+                data={
+                    "transactions_csv": (
+                        io.BytesIO(self._build_sample_transactions_csv().encode("utf-8")),
+                        "sample.TRANSACTIONS.1Y.csv",
+                    ),
+                    "positions_csv": (
+                        io.BytesIO(self._build_sample_positions_csv().encode("utf-8")),
+                        "sample_20260301_20260331.csv",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertIn("does not store your original CSV files", payload["message"])
+
+            stored = json.loads(INVESTMENT_STORE_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(stored["summary"]["total_record_count"], 1)
+            self.assertEqual(stored["starting_cash"], "1000.00")
+            self.assertEqual(stored["transactions"][0]["ticker"], "QQQ")
+        finally:
+            if original_bytes is None:
+                if INVESTMENT_STORE_PATH.exists():
+                    INVESTMENT_STORE_PATH.unlink()
+            else:
+                INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                INVESTMENT_STORE_PATH.write_bytes(original_bytes)
 
 
 if __name__ == "__main__":
