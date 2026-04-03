@@ -10,9 +10,12 @@ import io
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+
+import pandas as pd
 
 from app import create_app
-from app.infrastructure.storage import INVESTMENT_STORE_PATH
+from app.infrastructure.storage import INVESTMENT_STORE_PATH, history_store_path_for
 
 
 class MorePageTests(unittest.TestCase):
@@ -63,6 +66,9 @@ class MorePageTests(unittest.TestCase):
         self.assertIn('id="positions_csv"', body)
         self.assertIn('enctype="multipart/form-data"', body)
         self.assertIn('Your original CSV files are processed in memory only', body)
+        self.assertIn('id="investment_import_feedback_message"', body)
+        self.assertIn('notice-floating-banner', body)
+        self.assertIn('id="investment_import_submit_button"', body)
 
     def test_legacy_invest_routes_redirect_to_more_investment(self) -> None:
         client = create_app().test_client()
@@ -139,25 +145,29 @@ class MorePageTests(unittest.TestCase):
         original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
 
         try:
-            response = client.post(
-                "/api/investment/transactions",
-                data={
-                    "transactions_csv": (
-                        io.BytesIO(self._build_sample_transactions_csv().encode("utf-8")),
-                        "sample.TRANSACTIONS.1Y.csv",
-                    ),
-                    "positions_csv": (
-                        io.BytesIO(self._build_sample_positions_csv().encode("utf-8")),
-                        "sample_20260301_20260331.csv",
-                    ),
-                },
-                content_type="multipart/form-data",
-            )
+            with patch("app.web.runtime.ensure_latest_daily_caches", return_value=[]) as mocked_refresh:
+                response = client.post(
+                    "/api/investment/transactions",
+                    data={
+                        "transactions_csv": (
+                            io.BytesIO(self._build_sample_transactions_csv().encode("utf-8")),
+                            "sample.TRANSACTIONS.1Y.csv",
+                        ),
+                        "positions_csv": (
+                            io.BytesIO(self._build_sample_positions_csv().encode("utf-8")),
+                            "sample_20260301_20260331.csv",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                )
 
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
             self.assertTrue(payload["success"])
             self.assertIn("does not store your original CSV files", payload["message"])
+            self.assertIn("investment", payload)
+            self.assertIn("freshness_refresh_failures", payload)
+            mocked_refresh.assert_called_once_with(["QQQ"])
 
             stored = json.loads(INVESTMENT_STORE_PATH.read_text(encoding="utf-8"))
             self.assertEqual(stored["summary"]["total_record_count"], 1)
@@ -170,6 +180,124 @@ class MorePageTests(unittest.TestCase):
             else:
                 INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
                 INVESTMENT_STORE_PATH.write_bytes(original_bytes)
+
+    def test_import_prewarms_all_investment_tickers_not_only_open_tickers(self) -> None:
+        client = create_app().test_client()
+        original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
+
+        transactions_csv = "\n".join([
+            "Statement,Header,Field Name,Field Value",
+            "Statement,Data,Title,Transaction History",
+            "Summary,Header,Field Name,Field Value",
+            "Summary,Data,Starting Cash,1000.00",
+            "Summary,Data,Ending Cash,1000.00",
+            "Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quantity,Price,Price Currency,Gross Amount ,Commission,Net Amount",
+            "Transaction History,Data,2026-03-01,U***TEST,Open Position,Buy,QQQ,1,100,USD,-100,-1,-101",
+            "Transaction History,Data,2026-03-02,U***TEST,Closed Position,Buy,DRAM,1,50,USD,-50,-1,-51",
+            "Transaction History,Data,2026-03-03,U***TEST,Closed Position Exit,Sell,DRAM,-1,55,USD,55,-1,54",
+        ]) + "\n"
+
+        try:
+            with patch("app.web.runtime.ensure_latest_daily_caches", return_value=[]) as mocked_refresh:
+                response = client.post(
+                    "/api/investment/transactions",
+                    data={
+                        "transactions_csv": (
+                            io.BytesIO(transactions_csv.encode("utf-8")),
+                            "sample.TRANSACTIONS.1Y.csv",
+                        ),
+                        "positions_csv": (
+                            io.BytesIO(self._build_sample_positions_csv().encode("utf-8")),
+                            "sample_20260301_20260331.csv",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            self.assertEqual(response.status_code, 200)
+            mocked_refresh.assert_called_once_with(["DRAM", "QQQ"])
+        finally:
+            if original_bytes is None:
+                if INVESTMENT_STORE_PATH.exists():
+                    INVESTMENT_STORE_PATH.unlink()
+            else:
+                INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                INVESTMENT_STORE_PATH.write_bytes(original_bytes)
+
+    def test_investment_transactions_refresh_open_tickers_via_shared_freshness_helper(self) -> None:
+        client = create_app().test_client()
+        original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
+
+        payload = {
+            "starting_cash": "100.00",
+            "transactions": [
+                {
+                    "date": "2026-03-01",
+                    "type": "buy",
+                    "ticker": "QQQ",
+                    "quantity_raw": "1",
+                    "quantity_abs": "1",
+                    "price_raw": "100",
+                    "net_amount_raw": "-100",
+                    "normalized": {"display_quantity": "1", "net_amount": "-100"},
+                }
+            ],
+        }
+
+        try:
+            INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            INVESTMENT_STORE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+            with patch("app.web.runtime.ensure_latest_daily_caches", return_value=[]) as mocked_refresh:
+                response = client.get("/api/investment/transactions")
+
+            self.assertEqual(response.status_code, 200)
+            mocked_refresh.assert_called_once_with(["QQQ"])
+        finally:
+            if original_bytes is None:
+                if INVESTMENT_STORE_PATH.exists():
+                    INVESTMENT_STORE_PATH.unlink()
+            else:
+                INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                INVESTMENT_STORE_PATH.write_bytes(original_bytes)
+
+    def test_investment_parquet_fetches_missing_history_via_shared_market_data_path(self) -> None:
+        client = create_app().test_client()
+        ticker = "DRAM"
+        path = history_store_path_for(ticker)
+        original_exists = path.exists()
+        original_bytes = path.read_bytes() if original_exists else None
+
+        try:
+            if path.exists():
+                path.unlink()
+
+            def _mock_fetch_history(requested_ticker: str, include_dividends: bool) -> pd.DataFrame:
+                self.assertEqual(requested_ticker, ticker)
+                self.assertFalse(include_dividends)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(
+                    {
+                        "Date": pd.to_datetime(["2026-03-31"]),
+                        "Close": [42.0],
+                    }
+                ).to_parquet(path, index=False)
+                return pd.DataFrame({"Date": pd.to_datetime(["2026-03-31"]), "Close": [42.0]})
+
+            with patch("app.web.runtime.fetch_history", side_effect=_mock_fetch_history) as mocked_fetch:
+                response = client.get(f"/api/investment/parquet?ticker={ticker}")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["ticker"], ticker)
+            self.assertEqual(payload["prices"][0]["close"], 42.0)
+            mocked_fetch.assert_called_once()
+        finally:
+            if original_exists and original_bytes is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(original_bytes)
+            elif path.exists():
+                path.unlink()
 
 
 if __name__ == "__main__":
