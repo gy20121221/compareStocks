@@ -1,7 +1,7 @@
 """
 Tests for route stability across refactored web runtime branches.
 
-Code version: v0.3.0
+Code version: v0.3.1
 """
 
 from __future__ import annotations
@@ -69,6 +69,16 @@ class MorePageTests(unittest.TestCase):
         self.assertIn('id="investment_import_feedback_message"', body)
         self.assertIn('notice-floating-banner', body)
         self.assertIn('id="investment_import_submit_button"', body)
+
+    def test_more_investment_page_exposes_markdown_export_button(self) -> None:
+        client = create_app().test_client()
+
+        response = client.get("/more/investment")
+        body = response.get_data(as_text=True)
+
+        self.assertIn('class="export-transactions-button"', body)
+        self.assertIn('id="export_transactions_button"', body)
+        self.assertIn('title="Export Transactions"', body)
 
     def test_legacy_invest_routes_redirect_to_more_investment(self) -> None:
         client = create_app().test_client()
@@ -292,6 +302,84 @@ class MorePageTests(unittest.TestCase):
             self.assertEqual(payload["ticker"], ticker)
             self.assertEqual(payload["prices"][0]["close"], 42.0)
             mocked_fetch.assert_called_once()
+        finally:
+            if original_exists and original_bytes is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(original_bytes)
+            elif path.exists():
+                path.unlink()
+
+    def test_investment_transactions_skip_money_market_freshness_refresh(self) -> None:
+        client = create_app().test_client()
+        original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
+
+        payload = {
+            "starting_cash": "100.00",
+            "transactions": [
+                {
+                    "date": "2026-03-01",
+                    "type": "buy",
+                    "ticker": "QQQ",
+                    "quantity_raw": "1",
+                    "quantity_abs": "1",
+                    "price_raw": "100",
+                    "net_amount_raw": "-100",
+                    "normalized": {"display_quantity": "1", "net_amount": "-100"},
+                },
+                {
+                    "date": "2026-03-02",
+                    "type": "buy",
+                    "ticker": "005276756",
+                    "quantity_raw": "1",
+                    "quantity_abs": "1",
+                    "price_raw": "1",
+                    "net_amount_raw": "-1",
+                    "normalized": {"display_quantity": "1", "net_amount": "-1"},
+                },
+            ],
+        }
+
+        try:
+            INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            INVESTMENT_STORE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+            with patch("app.web.runtime.ensure_latest_daily_caches", return_value=[]) as mocked_refresh:
+                response = client.get("/api/investment/transactions")
+
+            self.assertEqual(response.status_code, 200)
+            mocked_refresh.assert_called_once_with(["QQQ"])
+        finally:
+            if original_bytes is None:
+                if INVESTMENT_STORE_PATH.exists():
+                    INVESTMENT_STORE_PATH.unlink()
+            else:
+                INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                INVESTMENT_STORE_PATH.write_bytes(original_bytes)
+
+    def test_investment_parquet_skips_money_market_refresh_when_local_data_exists(self) -> None:
+        client = create_app().test_client()
+        ticker = "005276756"
+        path = history_store_path_for(ticker)
+        original_exists = path.exists()
+        original_bytes = path.read_bytes() if original_exists else None
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "Date": pd.to_datetime(["2026-03-31"]),
+                    "Close": [1.0],
+                }
+            ).to_parquet(path, index=False)
+
+            with patch("app.web.runtime.ensure_latest_daily_caches") as mocked_refresh:
+                response = client.get(f"/api/investment/parquet?ticker={ticker}")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["ticker"], ticker)
+            self.assertEqual(payload["prices"][0]["close"], 1.0)
+            mocked_refresh.assert_not_called()
         finally:
             if original_exists and original_bytes is not None:
                 path.parent.mkdir(parents=True, exist_ok=True)
