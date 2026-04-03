@@ -1,7 +1,7 @@
 """
 Tests for route stability across refactored web runtime branches.
 
-Code version: v0.3.1
+Code version: v0.3.2
 """
 
 from __future__ import annotations
@@ -262,6 +262,54 @@ class MorePageTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             mocked_refresh.assert_called_once_with(["QQQ"])
+        finally:
+            if original_bytes is None:
+                if INVESTMENT_STORE_PATH.exists():
+                    INVESTMENT_STORE_PATH.unlink()
+            else:
+                INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                INVESTMENT_STORE_PATH.write_bytes(original_bytes)
+
+    def test_investment_transactions_attempts_profile_fetch_when_logo_asset_is_missing(self) -> None:
+        client = create_app().test_client()
+        original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
+
+        payload = {
+            "starting_cash": "100.00",
+            "transactions": [
+                {
+                    "date": "2026-03-01",
+                    "type": "buy",
+                    "ticker": "SNDK",
+                    "quantity_raw": "1",
+                    "quantity_abs": "1",
+                    "price_raw": "100",
+                    "net_amount_raw": "-100",
+                    "normalized": {"display_quantity": "1", "net_amount": "-100"},
+                }
+            ],
+        }
+
+        mock_profile = type(
+            "MockQuoteProfile",
+            (),
+            {"company_name": "Sandisk", "logo_url": "/market-store/logos/SNDK.png"},
+        )()
+
+        try:
+            INVESTMENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            INVESTMENT_STORE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+            with patch("app.web.runtime.ensure_latest_daily_caches", return_value=[]), \
+                    patch("app.web.runtime.has_logo_asset", return_value=False), \
+                    patch("app.web.runtime.load_profile_record", return_value={}), \
+                    patch("app.web.runtime.fetch_quote_profile", return_value=mock_profile) as mocked_fetch:
+                response = client.get("/api/investment/transactions")
+
+            self.assertEqual(response.status_code, 200)
+            body = response.get_json()
+            self.assertEqual(body["ticker_profiles"]["SNDK"]["company_name"], "Sandisk")
+            self.assertEqual(body["ticker_profiles"]["SNDK"]["logo_url"], "/market-store/logos/SNDK.png")
+            mocked_fetch.assert_called_once_with("SNDK", force_refresh=False)
         finally:
             if original_bytes is None:
                 if INVESTMENT_STORE_PATH.exists():

@@ -1,7 +1,7 @@
 """
 IBKR investment import service.
 
-Code version: v0.1.0
+Code version: v0.2.2
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ SCHEMA_VERSION = "3.0.0"
 DEFAULT_CONVENTION_TIME = "20:00:00"
 DEFAULT_CONVENTION_TIMEZONE = "America/New_York"
 ZERO = Decimal("0")
+CURRENCY_CODE_PATTERN = re.compile(r"\b([A-Z]{3})\b")
 
 TYPE_MAPPING = {
     "Deposit": "deposit",
@@ -90,15 +91,30 @@ def _classify_transaction_type(
     return normalized
 
 
-def _detect_currency(price_currency: str, description: str, symbol: str) -> str:
+def _detect_currency(
+    transaction_type: str,
+    price_currency: str,
+    description: str,
+    symbol: str,
+) -> str | None:
+    description_upper = description.upper()
+    description_currency_match = CURRENCY_CODE_PATTERN.search(description_upper)
+    description_currency = (
+        description_currency_match.group(1) if description_currency_match else None
+    )
     if "fx translations p&l" in description.lower():
         return "USD"
+    if transaction_type == "Deposit":
+        return None
+    if transaction_type in {"Credit Interest", "Debit Interest", "Dividend"}:
+        if description_currency is not None:
+            return description_currency
     normalized_price_currency = price_currency.strip()
     if normalized_price_currency and normalized_price_currency != "-":
         return normalized_price_currency
     if symbol.endswith(".HK"):
         return "HKD"
-    return "USD"
+    return None
 
 
 def _build_normalized_view(
@@ -197,7 +213,7 @@ def _build_transaction_record(
         "date": date_str,
         "datetime": _build_convention_datetime(date_str),
         "type": mapped_type,
-        "currency": _detect_currency(price_currency, description, symbol),
+        "currency": _detect_currency(transaction_type, price_currency, description, symbol),
         "description": description,
         "source": {
             "file_kind": "transactions",
@@ -541,4 +557,3 @@ def build_investment_payload_from_ibkr_csvs(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
     )
     return payload
-
