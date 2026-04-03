@@ -54,7 +54,12 @@ class MorePageTests(unittest.TestCase):
         response = client.get("/more/investment")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("My investment", response.get_data(as_text=True))
+        body = response.get_data(as_text=True)
+
+        self.assertIn("Investment", body)
+        self.assertIn('<article class="report-card trade-performance-card investment-report-card">', body)
+        self.assertIn('<article class="chart-surface investment-view-surface" id="investment_view_surface"', body)
+        self.assertIn('<article class="chart-surface investment-history-surface" id="investment_history_surface"', body)
 
     def test_more_investment_page_exposes_dual_csv_import_form(self) -> None:
         client = create_app().test_client()
