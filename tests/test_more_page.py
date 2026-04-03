@@ -58,7 +58,7 @@ class MorePageTests(unittest.TestCase):
 
         self.assertIn("Investment", body)
         self.assertIn('<article class="report-card trade-performance-card investment-report-card">', body)
-        self.assertIn('<article class="chart-surface investment-view-surface" id="investment_view_surface"', body)
+        self.assertIn('class="investment-surface-stack investment-view-surface" id="investment_view_surface"', body)
         self.assertIn('<article class="chart-surface investment-history-surface" id="investment_history_surface"', body)
 
     def test_more_investment_page_exposes_dual_csv_import_form(self) -> None:

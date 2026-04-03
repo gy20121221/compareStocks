@@ -1,7 +1,7 @@
 """
 IBKR investment import service.
 
-Code version: v0.2.2
+Code version: v0.2.3
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, TextIOWrapper
 from typing import Any
+
+from app.infrastructure.storage import normalize_ticker
 
 
 SCHEMA_VERSION = "3.0.0"
@@ -223,7 +225,7 @@ def _build_transaction_record(
     }
 
     if symbol and symbol != "-":
-        record["ticker"] = symbol
+        record["ticker"] = normalize_ticker(symbol)
     if quantity_dec is not None:
         record["quantity_raw"] = _decimal_to_str(quantity_dec)
         record["quantity_abs"] = _decimal_to_str(abs(quantity_dec))
@@ -281,7 +283,7 @@ def _build_grant_record(
         "type": "grant",
         "currency": currency,
         "description": f"Unvested shares from stock grant: {symbol}",
-        "ticker": symbol,
+        "ticker": normalize_ticker(symbol),
         "quantity_raw": _decimal_to_str(quantity_dec),
         "quantity_abs": _decimal_to_str(abs(quantity_dec)),
         "price_raw": _decimal_to_str(price_dec),
@@ -344,7 +346,7 @@ def _extract_open_position_summaries(
             continue
         if row[0] != "Open Positions" or row[1] != "Data" or row[2] != "Summary":
             continue
-        symbol = _normalize_text(row[5])
+        symbol = normalize_ticker(_normalize_text(row[5]))
         if not symbol:
             continue
         snapshots[symbol] = {
@@ -371,7 +373,7 @@ def _extract_performance_summaries(
         if row[0] != "Realized & Unrealized Performance Summary" or row[1] != "Data":
             continue
         asset_category = _normalize_text(row[2])
-        symbol = _normalize_text(row[3])
+        symbol = normalize_ticker(_normalize_text(row[3]))
         if not symbol or asset_category.startswith("Total"):
             continue
         snapshots[symbol] = {
@@ -446,6 +448,53 @@ def _sort_transactions(transactions: list[dict[str, Any]]) -> None:
             int(item.get("source", {}).get("row_number", 0)),
         )
     )
+
+
+def _normalize_snapshot_keys(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+
+    normalized_snapshot: dict[str, Any] = {}
+    for raw_ticker, payload in snapshot.items():
+        normalized_ticker = normalize_ticker(str(raw_ticker or ""))
+        if not normalized_ticker:
+            continue
+        if normalized_ticker in normalized_snapshot and isinstance(normalized_snapshot[normalized_ticker], dict) and isinstance(payload, dict):
+            normalized_snapshot[normalized_ticker] = {
+                **normalized_snapshot[normalized_ticker],
+                **payload,
+            }
+            continue
+        normalized_snapshot[normalized_ticker] = payload
+    return normalized_snapshot
+
+
+def normalize_investment_payload_tickers(payload: dict[str, Any]) -> dict[str, Any]:
+    transactions = payload.get("transactions")
+    if isinstance(transactions, list):
+        for txn in transactions:
+            if not isinstance(txn, dict):
+                continue
+            raw_ticker = txn.get("ticker")
+            if raw_ticker:
+                txn["ticker"] = normalize_ticker(str(raw_ticker))
+
+    payload["position_snapshot"] = _normalize_snapshot_keys(payload.get("position_snapshot"))
+    payload["performance_snapshot"] = _normalize_snapshot_keys(payload.get("performance_snapshot"))
+
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        holdings_validation = summary.get("holdings_validation")
+        mismatches = holdings_validation.get("mismatches") if isinstance(holdings_validation, dict) else None
+        if isinstance(mismatches, list):
+            for mismatch in mismatches:
+                if not isinstance(mismatch, dict):
+                    continue
+                raw_ticker = mismatch.get("ticker")
+                if raw_ticker:
+                    mismatch["ticker"] = normalize_ticker(str(raw_ticker))
+
+    return payload
 
 
 def _ensure_expected_sections(
@@ -553,6 +602,7 @@ def build_investment_payload_from_ibkr_csvs(
         "performance_snapshot": performance_snapshots,
         "transactions": transactions,
     }
+    normalize_investment_payload_tickers(payload)
     payload["summary"]["json_size_bytes"] = len(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
     )
