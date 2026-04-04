@@ -155,6 +155,53 @@ class MorePageTests(unittest.TestCase):
             {path: 200 for path in responses},
         )
 
+    def test_local_market_store_page_shows_short_history_badges_for_newly_listed_tickers(self) -> None:
+        client = create_app().test_client()
+        ticker = "DRAM"
+        history_path = history_store_path_for(ticker)
+        logo_path = history_path.parent.parent / "logos" / f"{ticker}.png"
+        original_history = history_path.read_bytes() if history_path.exists() else None
+        original_logo = logo_path.read_bytes() if logo_path.exists() else None
+
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "Date": pd.to_datetime(["2026-04-02"]),
+                    "Close": [25.0],
+                }
+            ).to_parquet(history_path, index=False)
+            logo_path.parent.mkdir(parents=True, exist_ok=True)
+            logo_path.write_bytes(b"dram-logo")
+
+            with (
+                patch("app.web.runtime.list_local_tickers", return_value=[ticker]),
+                patch("app.web.runtime.has_profile_record", return_value=True),
+                patch("app.web.runtime.has_logo_asset", return_value=True),
+                patch("app.web.runtime.load_profile_record", return_value={"company_name": "Roundhill Memory ETF"}),
+                patch("app.web.runtime.classify_daily_store_status", return_value="short_history"),
+                patch("app.web.runtime.classify_one_minute_store_status", return_value="short_history"),
+            ):
+                response = client.get("/settings/local-market-store")
+
+            self.assertEqual(response.status_code, 200)
+            body = response.get_data(as_text=True)
+            self.assertIn('data-local-store-ticker="DRAM"', body)
+            self.assertEqual(body.count('data-local-store-status="short-history"'), 2)
+            self.assertNotIn('value="refresh"', body)
+            self.assertNotIn('value="refresh-1m"', body)
+        finally:
+            if original_history is None:
+                if history_path.exists():
+                    history_path.unlink()
+            else:
+                history_path.write_bytes(original_history)
+            if original_logo is None:
+                if logo_path.exists():
+                    logo_path.unlink()
+            else:
+                logo_path.write_bytes(original_logo)
+
     def test_ibkr_csv_import_rebuilds_investment_store(self) -> None:
         client = create_app().test_client()
         original_bytes = INVESTMENT_STORE_PATH.read_bytes() if INVESTMENT_STORE_PATH.exists() else None
