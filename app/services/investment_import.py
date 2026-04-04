@@ -1,7 +1,7 @@
 """
 IBKR investment import service.
 
-Code version: v0.2.3
+Code version: v0.2.4
 """
 
 from __future__ import annotations
@@ -104,11 +104,13 @@ def _detect_currency(
     description_currency = (
         description_currency_match.group(1) if description_currency_match else None
     )
+    if description_currency == "TAX":
+        description_currency = None
     if "fx translations p&l" in description.lower():
         return "USD"
     if transaction_type == "Deposit":
         return None
-    if transaction_type in {"Credit Interest", "Debit Interest", "Dividend"}:
+    if transaction_type in {"Credit Interest", "Debit Interest", "Dividend", "Foreign Tax Withholding"}:
         if description_currency is not None:
             return description_currency
     normalized_price_currency = price_currency.strip()
@@ -116,6 +118,8 @@ def _detect_currency(
         return normalized_price_currency
     if symbol.endswith(".HK"):
         return "HKD"
+    if "us tax" in description.lower():
+        return "USD"
     return None
 
 

@@ -1,7 +1,7 @@
 """
 Tests for IBKR investment import normalization.
 
-Code version: v0.1.2
+Code version: v0.1.3
 """
 
 from __future__ import annotations
@@ -126,6 +126,33 @@ class InvestmentImportTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["transactions"][0]["type"], "dividend")
+        self.assertEqual(payload["transactions"][0]["currency"], "USD")
+
+    def test_import_detects_foreign_tax_withholding_currency_from_description(self) -> None:
+        transactions_csv = "\n".join([
+            "Statement,Header,Field Name,Field Value",
+            "Statement,Data,Title,Transaction History",
+            "Summary,Header,Field Name,Field Value",
+            "Summary,Data,Starting Cash,0",
+            "Summary,Data,Ending Cash,-0.42",
+            "Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quantity,Price,Price Currency,Gross Amount ,Commission,Net Amount",
+            "Transaction History,Data,2025-12-23,U***TEST,META(US30303M1027) Cash Dividend USD 0.525 per Share - US Tax,Foreign Tax Withholding,-,-,-,-,-0.42,-,-0.42",
+        ]) + "\n"
+        positions_csv = "\n".join([
+            "Statement,Header,Field Name,Field Value",
+            "Statement,Data,Title,Realized Summary",
+            "Realized & Unrealized Performance Summary,Header,Asset Category,Symbol,Cost Adj.,Realized S/T Profit,Realized S/T Loss,Realized L/T Profit,Realized L/T Loss,Realized Total,Unrealized S/T Profit,Unrealized S/T Loss,Unrealized L/T Profit,Unrealized L/T Loss,Unrealized Total,Total,Code",
+            "Realized & Unrealized Performance Summary,Data,Cash,USD,0,0,0,0,0,0,0,0,0,0,0,0,",
+            "Open Positions,Header,DataDiscriminator,Asset Category,Currency,Symbol,Open,Quantity,Mult,Cost Price,Cost Basis,Close Price,Value,Unrealized P/L,Code",
+            "Open Positions,Total,,Stocks,USD,,,,,,0,,0,0,",
+        ]) + "\n"
+
+        payload = build_investment_payload_from_ibkr_csvs(
+            transactions_csv.encode("utf-8"),
+            positions_csv.encode("utf-8"),
+        )
+
+        self.assertEqual(payload["transactions"][0]["type"], "foreign_tax_withholding")
         self.assertEqual(payload["transactions"][0]["currency"], "USD")
 
 
