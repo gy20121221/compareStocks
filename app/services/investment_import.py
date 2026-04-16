@@ -181,12 +181,12 @@ def _build_normalized_view(
 
 
 def _iter_csv_rows(payload: bytes) -> list[list[str]]:
-    buffer = BytesIO(payload)
-    text_stream = TextIOWrapper(buffer, encoding="utf-8-sig", newline="")
-    try:
+    with BytesIO(payload) as buffer, TextIOWrapper(
+        buffer,
+        encoding="utf-8-sig",
+        newline="",
+    ) as text_stream:
         return list(csv.reader(text_stream))
-    finally:
-        text_stream.close()
 
 
 def _build_transaction_record(
