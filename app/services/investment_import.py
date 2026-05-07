@@ -1,7 +1,7 @@
 """
 IBKR investment import service.
 
-Code version: v0.2.4
+Code version: v0.2.5
 """
 
 from __future__ import annotations
@@ -38,7 +38,12 @@ TYPE_MAPPING = {
 }
 
 GRANT_PATTERN = re.compile(
-    r"^(?P<grant_date>\d{4}-\d{2}-\d{2})\s+\(Vesting:\s+(?P<vesting_date>\d{4}-\d{2}-\d{2})\)$"
+    r"^(?P<grant_date>\d{4}-\d{2}-\d{2})"
+    r"(?:,\s+\d{2}:\d{2}:\d{2})?"
+    r"\s+\(Vesting:\s+"
+    r"(?P<vesting_date>\d{4}-\d{2}-\d{2})"
+    r"(?:,\s+\d{2}:\d{2}:\d{2})?"
+    r"\)$"
 )
 
 
@@ -254,7 +259,7 @@ def _build_transaction_record(
     return record
 
 
-def _build_grant_record(
+def _build_grant_candidate(
     row: list[str],
     row_number: int,
     warnings: list[str],
@@ -275,30 +280,49 @@ def _build_grant_record(
     price_dec = _parse_decimal(row[9], "grant_cost_price", row_number, warnings)
     if not symbol or quantity_dec is None or price_dec is None:
         warnings.append(
-            f"Row {row_number}: unable to synthesize stock grant from Open Positions lot"
+            f"Row {row_number}: unable to parse stock grant lot from Open Positions"
         )
         return None
 
     grant_date = match.group("grant_date")
     vesting_date = match.group("vesting_date")
     return {
+        "grant_date": grant_date,
+        "vesting_date": vesting_date,
+        "currency": currency,
+        "ticker": normalize_ticker(symbol),
+        "price_raw": _decimal_to_str(price_dec),
+        "source": {
+            "file_kind": "positions",
+            "row_number": row_number,
+            "transaction_type_raw": "Stock Grant",
+        },
+        "lot_quantity_raw": _decimal_to_str(quantity_dec),
+    }
+
+
+def _build_grant_record_from_candidate(
+    candidate: dict[str, Any],
+    quantity_dec: Decimal,
+) -> dict[str, Any]:
+    price_dec = Decimal(str(candidate["price_raw"]))
+    grant_date = str(candidate["grant_date"])
+    vesting_date = str(candidate["vesting_date"])
+    symbol = str(candidate["ticker"])
+    return {
         "date": grant_date,
         "datetime": _build_convention_datetime(grant_date),
         "type": "grant",
-        "currency": currency,
+        "currency": candidate["currency"],
         "description": f"Unvested shares from stock grant: {symbol}",
-        "ticker": normalize_ticker(symbol),
+        "ticker": symbol,
         "quantity_raw": _decimal_to_str(quantity_dec),
         "quantity_abs": _decimal_to_str(abs(quantity_dec)),
         "price_raw": _decimal_to_str(price_dec),
         "gross_amount_raw": "0",
         "net_amount_raw": "0",
         "vesting_date": _build_convention_datetime(vesting_date),
-        "source": {
-            "file_kind": "positions",
-            "row_number": row_number,
-            "transaction_type_raw": "Stock Grant",
-        },
+        "source": candidate["source"],
         "normalized": _build_normalized_view(
             "grant",
             quantity_dec,
@@ -310,6 +334,62 @@ def _build_grant_record(
             side_override="buy",
         ),
     }
+
+
+def _synthesize_grant_records(
+    grant_candidates: list[dict[str, Any]],
+    transactions: list[dict[str, Any]],
+    open_position_snapshots: dict[str, dict[str, str]],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    if not grant_candidates:
+        return []
+
+    replayed_without_grants = _replay_holdings(transactions)
+    candidates_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for candidate in grant_candidates:
+        ticker = str(candidate.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        candidates_by_ticker.setdefault(ticker, []).append(candidate)
+
+    grants: list[dict[str, Any]] = []
+    for ticker, ticker_candidates in candidates_by_ticker.items():
+        snapshot = open_position_snapshots.get(ticker)
+        snapshot_quantity = Decimal(snapshot["quantity"]) if snapshot else ZERO
+        known_quantity = replayed_without_grants.get(ticker, ZERO)
+        remaining_quantity = snapshot_quantity - known_quantity
+        if remaining_quantity <= ZERO:
+            warnings.append(
+                f"Ticker {ticker}: skipped stock grant synthesis because the inferred missing quantity is {remaining_quantity}."
+            )
+            continue
+
+        ordered_candidates = sorted(
+            ticker_candidates,
+            key=lambda item: (
+                str(item.get("grant_date") or ""),
+                int(item.get("source", {}).get("row_number", 0)),
+            ),
+        )
+        for index, candidate in enumerate(ordered_candidates):
+            if remaining_quantity <= ZERO:
+                break
+            lot_quantity = Decimal(str(candidate.get("lot_quantity_raw") or "0"))
+            if index == len(ordered_candidates) - 1:
+                grant_quantity = remaining_quantity
+            else:
+                grant_quantity = min(lot_quantity, remaining_quantity)
+            if grant_quantity <= ZERO:
+                continue
+            if grant_quantity != lot_quantity:
+                warnings.append(
+                    f"Ticker {ticker}: inferred stock grant quantity {grant_quantity} differs from open lot quantity {lot_quantity}."
+                )
+            grants.append(_build_grant_record_from_candidate(candidate, grant_quantity))
+            remaining_quantity -= grant_quantity
+
+    return grants
 
 
 def _extract_summary_fields(
@@ -550,15 +630,21 @@ def build_investment_payload_from_ibkr_csvs(
         for record in [_build_transaction_record(row, row_number, warnings, unknown_types)]
         if record is not None
     ]
-    grants = [
+    grant_candidates = [
         record
         for row_number, row in enumerate(positions_rows, start=1)
-        for record in [_build_grant_record(row, row_number, warnings)]
+        for record in [_build_grant_candidate(row, row_number, warnings)]
         if record is not None
     ]
 
     open_position_snapshots = _extract_open_position_summaries(positions_rows, warnings)
     performance_snapshots = _extract_performance_summaries(positions_rows, warnings)
+    grants = _synthesize_grant_records(
+        grant_candidates,
+        transactions,
+        open_position_snapshots,
+        warnings,
+    )
     transactions.extend(grants)
     _sort_transactions(transactions)
 
