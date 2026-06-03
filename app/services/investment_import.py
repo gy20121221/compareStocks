@@ -1,7 +1,7 @@
 """
 IBKR investment import service.
 
-Code version: v0.2.5
+Code version: v0.3.0
 """
 
 from __future__ import annotations
@@ -53,6 +53,10 @@ def _now_iso() -> str:
 
 def _normalize_text(value: str | None) -> str:
     return str(value or "").strip()
+
+
+def _normalize_whitespace(value: str | None) -> str:
+    return " ".join(_normalize_text(value).split())
 
 
 def _decimal_to_str(value: Decimal | None) -> str | None:
@@ -534,6 +538,208 @@ def _sort_transactions(transactions: list[dict[str, Any]]) -> None:
     )
 
 
+def _transaction_identity_key(record: dict[str, Any]) -> tuple[str, ...]:
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    normalized_type = _normalize_text(record.get("type")).lower()
+    ticker = normalize_ticker(_normalize_text(record.get("ticker"))) if record.get("ticker") else ""
+    return (
+        _normalize_text(record.get("date")),
+        normalized_type,
+        ticker,
+        _normalize_text(record.get("currency")).upper(),
+        _normalize_whitespace(record.get("description")),
+        _normalize_text(record.get("quantity_raw")),
+        _normalize_text(record.get("price_raw")),
+        _normalize_text(record.get("gross_amount_raw")),
+        _normalize_text(record.get("commission_raw")),
+        _normalize_text(record.get("net_amount_raw")),
+        _normalize_text(record.get("vesting_date")),
+        _normalize_text(source.get("transaction_type_raw")),
+    )
+
+
+def _is_missing_merge_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict, tuple, set)):
+        return not value
+    return False
+
+
+def _merge_transaction_records(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(current)
+    for key, incoming_value in incoming.items():
+        current_value = merged.get(key)
+        if isinstance(current_value, dict) and isinstance(incoming_value, dict):
+            nested = dict(current_value)
+            for nested_key, nested_incoming_value in incoming_value.items():
+                nested_current_value = nested.get(nested_key)
+                if _is_missing_merge_value(nested_current_value) and not _is_missing_merge_value(nested_incoming_value):
+                    nested[nested_key] = nested_incoming_value
+                elif not _is_missing_merge_value(nested_incoming_value):
+                    nested[nested_key] = nested_incoming_value
+            merged[key] = nested
+            continue
+        if _is_missing_merge_value(current_value) and not _is_missing_merge_value(incoming_value):
+            merged[key] = incoming_value
+        elif not _is_missing_merge_value(incoming_value):
+            merged[key] = incoming_value
+    return merged
+
+
+def _merge_non_grant_transactions(
+    existing_transactions: list[dict[str, Any]],
+    incoming_transactions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    merged_by_key: dict[tuple[tuple[str, ...], int], dict[str, Any]] = {}
+    duplicate_count = 0
+    existing_occurrences: dict[tuple[str, ...], int] = {}
+    for record in existing_transactions:
+        if _normalize_text(record.get("type")).lower() == "grant":
+            continue
+        identity_key = _transaction_identity_key(record)
+        occurrence_index = existing_occurrences.get(identity_key, 0)
+        existing_occurrences[identity_key] = occurrence_index + 1
+        merged_by_key[(identity_key, occurrence_index)] = dict(record)
+
+    incoming_occurrences: dict[tuple[str, ...], int] = {}
+    for record in incoming_transactions:
+        if _normalize_text(record.get("type")).lower() == "grant":
+            continue
+        identity_key = _transaction_identity_key(record)
+        occurrence_index = incoming_occurrences.get(identity_key, 0)
+        incoming_occurrences[identity_key] = occurrence_index + 1
+        composite_key = (identity_key, occurrence_index)
+        existing_record = merged_by_key.get(composite_key)
+        if existing_record is None:
+            merged_by_key[composite_key] = dict(record)
+            continue
+        duplicate_count += 1
+        merged_by_key[composite_key] = _merge_transaction_records(existing_record, record)
+
+    merged_transactions = list(merged_by_key.values())
+    _sort_transactions(merged_transactions)
+    return merged_transactions, duplicate_count
+
+
+def _payload_transactions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_transactions = payload.get("transactions")
+    if not isinstance(raw_transactions, list):
+        return []
+    return [txn for txn in raw_transactions if isinstance(txn, dict)]
+
+
+def _payload_transaction_dates(payload: dict[str, Any]) -> list[str]:
+    return [
+        _normalize_text(txn.get("date"))
+        for txn in _payload_transactions(payload)
+        if _normalize_text(txn.get("date"))
+    ]
+
+
+def _payload_sort_key(payload: dict[str, Any]) -> tuple[str, int, int, int, str]:
+    transaction_dates = _payload_transaction_dates(payload)
+    position_snapshot = payload.get("position_snapshot")
+    performance_snapshot = payload.get("performance_snapshot")
+    generator = payload.get("generator")
+    return (
+        max(transaction_dates) if transaction_dates else "",
+        len(position_snapshot) if isinstance(position_snapshot, dict) else 0,
+        len(performance_snapshot) if isinstance(performance_snapshot, dict) else 0,
+        len(_payload_transactions(payload)),
+        _normalize_text(generator.get("generated_at")) if isinstance(generator, dict) else "",
+    )
+
+
+def _payload_earliest_sort_key(payload: dict[str, Any]) -> tuple[str, int, str]:
+    transaction_dates = _payload_transaction_dates(payload)
+    generator = payload.get("generator")
+    return (
+        min(transaction_dates) if transaction_dates else "9999-12-31",
+        -len(_payload_transactions(payload)),
+        _normalize_text(generator.get("generated_at")) if isinstance(generator, dict) else "",
+    )
+
+
+def _pick_latest_payload(existing_payload: dict[str, Any], incoming_payload: dict[str, Any]) -> dict[str, Any]:
+    return incoming_payload if _payload_sort_key(incoming_payload) >= _payload_sort_key(existing_payload) else existing_payload
+
+
+def _pick_earliest_payload(existing_payload: dict[str, Any], incoming_payload: dict[str, Any]) -> dict[str, Any]:
+    return incoming_payload if _payload_earliest_sort_key(incoming_payload) < _payload_earliest_sort_key(existing_payload) else existing_payload
+
+
+def _summary_list(summary: dict[str, Any] | None, key: str) -> list[str]:
+    if not isinstance(summary, dict):
+        return []
+    raw_value = summary.get(key)
+    if not isinstance(raw_value, list):
+        return []
+    return [str(item) for item in raw_value if str(item).strip()]
+
+
+def _summary_text(summary: dict[str, Any] | None, key: str) -> str | None:
+    if not isinstance(summary, dict):
+        return None
+    value = summary.get(key)
+    text = _normalize_text(value)
+    return text or None
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized_value = _normalize_text(value)
+        if not normalized_value or normalized_value in seen:
+            continue
+        seen.add(normalized_value)
+        ordered.append(normalized_value)
+    return ordered
+
+
+def _build_summary(
+    *,
+    transactions: list[dict[str, Any]],
+    warnings: list[str],
+    unknown_types: list[str],
+    holdings_mismatches: list[dict[str, str]],
+    open_position_snapshots: dict[str, dict[str, str]],
+    performance_snapshots: dict[str, dict[str, str]],
+    starting_cash: str | None,
+    ending_cash: str | None,
+    merge_details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    grant_count = sum(
+        1
+        for record in transactions
+        if _normalize_text(record.get("type")).lower() == "grant"
+    )
+    summary: dict[str, Any] = {
+        "starting_cash_raw": starting_cash,
+        "ending_cash_raw": ending_cash,
+        "transaction_count": len(transactions) - grant_count,
+        "grant_count": grant_count,
+        "total_record_count": len(transactions),
+        "unknown_transaction_type_count": len(unknown_types),
+        "unknown_transaction_types": sorted(unknown_types),
+        "warning_count": len(warnings),
+        "warnings": warnings,
+        "holdings_validation": {
+            "matched": not holdings_mismatches,
+            "mismatch_count": len(holdings_mismatches),
+            "mismatches": holdings_mismatches,
+        },
+        "open_position_count": len(open_position_snapshots),
+        "performance_symbol_count": len(performance_snapshots),
+    }
+    if merge_details:
+        summary["incremental_import"] = merge_details
+    return summary
+
+
 def _normalize_snapshot_keys(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(snapshot, dict):
         return {}
@@ -668,29 +874,145 @@ def build_investment_payload_from_ibkr_csvs(
             "timezone": DEFAULT_CONVENTION_TIMEZONE,
             "source_has_intraday_timestamp": False,
         },
-        "summary": {
-            "starting_cash_raw": _decimal_to_str(summary_fields["starting_cash"]),
-            "ending_cash_raw": _decimal_to_str(summary_fields["ending_cash"]),
-            "transaction_count": len(transactions) - len(grants),
-            "grant_count": len(grants),
-            "total_record_count": len(transactions),
-            "unknown_transaction_type_count": len(unknown_types),
-            "unknown_transaction_types": sorted(unknown_types),
-            "warning_count": len(warnings),
-            "warnings": warnings,
-            "holdings_validation": {
-                "matched": not holdings_mismatches,
-                "mismatch_count": len(holdings_mismatches),
-                "mismatches": holdings_mismatches,
-            },
-            "open_position_count": len(open_position_snapshots),
-            "performance_symbol_count": len(performance_snapshots),
-        },
+        "summary": _build_summary(
+            transactions=transactions,
+            warnings=warnings,
+            unknown_types=sorted(unknown_types),
+            holdings_mismatches=holdings_mismatches,
+            open_position_snapshots=open_position_snapshots,
+            performance_snapshots=performance_snapshots,
+            starting_cash=_decimal_to_str(summary_fields["starting_cash"]),
+            ending_cash=_decimal_to_str(summary_fields["ending_cash"]),
+        ),
         "starting_cash": _decimal_to_str(summary_fields["starting_cash"]),
         "ending_cash": _decimal_to_str(summary_fields["ending_cash"]),
         "position_snapshot": open_position_snapshots,
         "performance_snapshot": performance_snapshots,
         "transactions": transactions,
+    }
+    normalize_investment_payload_tickers(payload)
+    payload["summary"]["json_size_bytes"] = len(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    return payload
+
+
+def merge_investment_payloads(
+    existing_payload: dict[str, Any] | None,
+    incoming_payload: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_incoming = normalize_investment_payload_tickers(incoming_payload)
+    if not existing_payload:
+        return normalized_incoming
+
+    normalized_existing = normalize_investment_payload_tickers(existing_payload)
+    existing_broker = _normalize_text(normalized_existing.get("broker")).lower()
+    incoming_broker = _normalize_text(normalized_incoming.get("broker")).lower()
+    if existing_broker and incoming_broker and existing_broker != incoming_broker:
+        raise ValueError(
+            "The existing local investment store belongs to a different broker import format."
+        )
+
+    existing_account = _normalize_text(normalized_existing.get("account"))
+    incoming_account = _normalize_text(normalized_incoming.get("account"))
+    if existing_account and incoming_account and existing_account != incoming_account:
+        raise ValueError(
+            "The uploaded CSV files belong to a different IBKR account than the current local investment store."
+        )
+
+    latest_payload = _pick_latest_payload(normalized_existing, normalized_incoming)
+    earliest_payload = _pick_earliest_payload(normalized_existing, normalized_incoming)
+    latest_grants = [
+        dict(txn)
+        for txn in _payload_transactions(latest_payload)
+        if _normalize_text(txn.get("type")).lower() == "grant"
+    ]
+    merged_non_grant_transactions, duplicate_count = _merge_non_grant_transactions(
+        _payload_transactions(normalized_existing),
+        _payload_transactions(normalized_incoming),
+    )
+    merged_transactions = merged_non_grant_transactions + latest_grants
+    _sort_transactions(merged_transactions)
+
+    open_position_snapshots = _normalize_snapshot_keys(latest_payload.get("position_snapshot"))
+    performance_snapshots = _normalize_snapshot_keys(latest_payload.get("performance_snapshot"))
+    holdings_mismatches = _validate_holdings(merged_transactions, open_position_snapshots)
+
+    existing_summary = normalized_existing.get("summary") if isinstance(normalized_existing.get("summary"), dict) else {}
+    incoming_summary = normalized_incoming.get("summary") if isinstance(normalized_incoming.get("summary"), dict) else {}
+    warnings = _unique_preserving_order(
+        _summary_list(existing_summary, "warnings") + _summary_list(incoming_summary, "warnings")
+    )
+    unknown_types = _unique_preserving_order(
+        _summary_list(existing_summary, "unknown_transaction_types")
+        + _summary_list(incoming_summary, "unknown_transaction_types")
+    )
+
+    starting_cash = (
+        _summary_text(earliest_payload.get("summary"), "starting_cash_raw")
+        or _normalize_text(earliest_payload.get("starting_cash"))
+        or None
+    )
+    ending_cash = (
+        _summary_text(latest_payload.get("summary"), "ending_cash_raw")
+        or _normalize_text(latest_payload.get("ending_cash"))
+        or None
+    )
+    added_record_count = max(len(merged_transactions) - len(_payload_transactions(normalized_existing)), 0)
+    merge_details = {
+        "mode": "incremental_union",
+        "existing_record_count": len(_payload_transactions(normalized_existing)),
+        "imported_record_count": len(_payload_transactions(normalized_incoming)),
+        "added_record_count": added_record_count,
+        "duplicate_record_count": duplicate_count,
+        "snapshot_source": (
+            "incoming"
+            if latest_payload is normalized_incoming
+            else "existing"
+        ),
+        "account_verified": not (
+            existing_account and incoming_account and existing_account != incoming_account
+        ),
+    }
+
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "generator": {
+            "name": "ibkr_csv_to_investment_json",
+            "version": SCHEMA_VERSION,
+            "generated_at": _now_iso(),
+        },
+        "broker": incoming_broker or existing_broker or "ibkr",
+        "account": incoming_account or existing_account or None,
+        "datetime_policy": (
+            normalized_incoming.get("datetime_policy")
+            or normalized_existing.get("datetime_policy")
+            or {
+                "date_field_meaning": "Original trading date from CSV",
+                "datetime_field_meaning": (
+                    "Business-convention datetime derived from date "
+                    f"with default time {DEFAULT_CONVENTION_TIME}"
+                ),
+                "timezone": DEFAULT_CONVENTION_TIMEZONE,
+                "source_has_intraday_timestamp": False,
+            }
+        ),
+        "summary": _build_summary(
+            transactions=merged_transactions,
+            warnings=warnings,
+            unknown_types=unknown_types,
+            holdings_mismatches=holdings_mismatches,
+            open_position_snapshots=open_position_snapshots,
+            performance_snapshots=performance_snapshots,
+            starting_cash=starting_cash,
+            ending_cash=ending_cash,
+            merge_details=merge_details,
+        ),
+        "starting_cash": starting_cash,
+        "ending_cash": ending_cash,
+        "position_snapshot": open_position_snapshots,
+        "performance_snapshot": performance_snapshots,
+        "transactions": merged_transactions,
     }
     normalize_investment_payload_tickers(payload)
     payload["summary"]["json_size_bytes"] = len(
